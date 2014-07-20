@@ -2,6 +2,8 @@
   https://github.com/cloudwu/lua-serialize
  */
 
+#include "skynet_malloc.h"
+
 #include <lua.h>
 #include <lauxlib.h>
 #include <stdlib.h>
@@ -19,7 +21,6 @@
 // hibits 0~31 : len
 #define TYPE_LONG_STRING 5
 #define TYPE_TABLE 6
-#define TYPE_REMOTE 7
 
 #define MAX_COOKIE 32
 #define COMBINE_TYPE(t,v) ((t) | (v) << 3)
@@ -48,7 +49,7 @@ struct read_block {
 
 inline static struct block *
 blk_alloc(void) {
-	struct block *b = malloc(sizeof(struct block));
+	struct block *b = skynet_malloc(sizeof(struct block));
 	b->next = NULL;
 	return b;
 }
@@ -111,7 +112,7 @@ wb_free(struct write_block *wb) {
 	struct block *blk = wb->head;
 	while (blk) {
 		struct block * next = blk->next;
-		free(blk);
+		skynet_free(blk);
 		blk = next;
 	}
 	wb->head = NULL;
@@ -143,7 +144,7 @@ rb_read(struct read_block *rb, void *buffer, int sz) {
 
 	if (rb->ptr == BLOCK_SIZE) {
 		struct block * next = rb->current->next;
-		free(rb->current);
+		skynet_free(rb->current);
 		rb->current = next;
 		rb->ptr = 0;
 	}
@@ -166,7 +167,7 @@ rb_read(struct read_block *rb, void *buffer, int sz) {
 
 	for (;;) {
 		struct block * next = rb->current->next;
-		free(rb->current);
+		skynet_free(rb->current);
 		rb->current = next;
 
 		if (sz < BLOCK_SIZE) {
@@ -186,7 +187,7 @@ static void
 rb_close(struct read_block *rb) {
 	while (rb->current) {
 		struct block * next = rb->current->next;
-		free(rb->current);
+		skynet_free(rb->current);
 		rb->current = next;
 	}
 	rb->len = 0;
@@ -254,11 +255,18 @@ wb_string(struct write_block *wb, const char *str, int len) {
 			wb_push(wb, str, len);
 		}
 	} else {
-		assert(len < 0x10000);
-		int n = TYPE_LONG_STRING;
-		wb_push(wb, &n, 1);
-		uint16_t x = (uint16_t) len;
-		wb_push(wb, &x, 2);
+		int n;
+		if (len < 0x10000) {
+			n = COMBINE_TYPE(TYPE_LONG_STRING, 2);
+			wb_push(wb, &n, 1);
+			uint16_t x = (uint16_t) len;
+			wb_push(wb, &x, 2);
+		} else {
+			n = COMBINE_TYPE(TYPE_LONG_STRING, 4);
+			wb_push(wb, &n, 1);
+			uint32_t x = (uint32_t) len;
+			wb_push(wb, &x, 4);
+		}
 		wb_push(wb, str, len);
 	}
 }
@@ -268,7 +276,7 @@ static void _pack_one(lua_State *L, struct write_block *b, int index, int depth)
 static int
 wb_table_array(lua_State *L, struct write_block * wb, int index, int depth) {
 	int array_size = lua_rawlen(L,index);
-	if (array_size > MAX_COOKIE-1) {
+	if (array_size >= MAX_COOKIE-1) {
 		int n = COMBINE_TYPE(TYPE_TABLE, MAX_COOKIE-1);
 		wb_push(wb, &n, 1);
 		wb_integer(wb, array_size,TYPE_NUMBER);
@@ -293,7 +301,7 @@ wb_table_hash(lua_State *L, struct write_block * wb, int index, int depth, int a
 	while (lua_next(L, index) != 0) {
 		if (lua_type(L,-2) == LUA_TNUMBER) {
 			lua_Number k = lua_tonumber(L,-2);
-			lua_Integer x = lua_tointeger(L,-2);
+			int32_t x = (int32_t)lua_tointeger(L,-2);
 			if (k == (lua_Number)x && x>0 && x<=array_size) {
 				lua_pop(L,1);
 				continue;
@@ -327,7 +335,7 @@ _pack_one(lua_State *L, struct write_block *b, int index, int depth) {
 		wb_nil(b);
 		break;
 	case LUA_TNUMBER: {
-		lua_Integer x = lua_tointeger(L,index);
+		int32_t x = (int32_t)lua_tointeger(L,index);
 		lua_Number n = lua_tonumber(L,index);
 		if ((lua_Number)x==n) {
 			wb_integer(b, x, TYPE_NUMBER);
@@ -342,11 +350,7 @@ _pack_one(lua_State *L, struct write_block *b, int index, int depth) {
 	case LUA_TSTRING: {
 		size_t sz = 0;
 		const char *str = lua_tolstring(L,index,&sz);
-		if (sz >= 0x10000) {
-			wb_free(b);
-			luaL_error(L,"string is too long to serialize");
-		}
-		wb_string(b, str, sz);
+		wb_string(b, str, (int)sz);
 		break;
 	}
 	case LUA_TLIGHTUSERDATA:
@@ -356,16 +360,7 @@ _pack_one(lua_State *L, struct write_block *b, int index, int depth) {
 		if (index < 0) {
 			index = lua_gettop(L) + index + 1;
 		}
-		lua_pushvalue(L, lua_upvalueindex(2));	// __remote
-		lua_rawget(L, index);
-		if (lua_isnumber(L,-1)) {
-			int handle = lua_tointeger(L,-1);
-			lua_pop(L,1);
-			wb_integer(b, handle, TYPE_REMOTE);
-		} else {
-			lua_pop(L,1);
-			wb_table(L, b, index, depth+1);
-		}
+		wb_table(L, b, index, depth+1);
 		break;
 	}
 	default:
@@ -453,6 +448,9 @@ static void
 _get_buffer(lua_State *L, struct read_block *rb, int len) {
 	char tmp[len];
 	char * p = rb_read(rb,tmp,len);
+	if (p == NULL) {
+		_invalid_stream(L,rb);
+	}
 	lua_pushlstring(L,p,len);
 }
 
@@ -504,33 +502,31 @@ _push_value(lua_State *L, struct read_block *rb, int type, int cookie) {
 		_get_buffer(L,rb,cookie);
 		break;
 	case TYPE_LONG_STRING: {
-		uint16_t len = 0;
-		uint16_t *plen = rb_read(rb, &len, 2);
-		if (plen == NULL) {
-			_invalid_stream(L,rb);
+		uint32_t len;
+		if (cookie == 2) {
+			uint16_t *plen = rb_read(rb, &len, 2);
+			if (plen == NULL) {
+				_invalid_stream(L,rb);
+			}
+			_get_buffer(L,rb,(int)*plen);
+		} else {
+			if (cookie != 4) {
+				_invalid_stream(L,rb);
+			}
+			uint32_t *plen = rb_read(rb, &len, 4);
+			if (plen == NULL) {
+				_invalid_stream(L,rb);
+			}
+			_get_buffer(L,rb,(int)*plen);
 		}
-		_get_buffer(L,rb,*plen);
 		break;
 	}
 	case TYPE_TABLE: {
 		_unpack_table(L,rb,cookie);
 		break;
 	}
-	case TYPE_REMOTE: {
-		lua_pushvalue(L,lua_upvalueindex(1));	// metatable
-		int handle = _get_integer(L,rb,cookie);
-		lua_rawgeti(L,-1,handle);
-		if (lua_isnil(L,-1)) {
-			lua_pop(L,2);
-			lua_createtable(L,0,1);
-			lua_pushvalue(L,lua_upvalueindex(2));	// __remote
-			lua_pushinteger(L,handle);
-			lua_rawset(L,-3);
-			lua_pushvalue(L,lua_upvalueindex(1));	// metatable
-			lua_setmetatable(L,-2);
-		} else {
-			lua_replace(L, -2);
-		}
+	default: {
+		_invalid_stream(L,rb);
 		break;
 	}
 	}
@@ -552,7 +548,7 @@ _seri(lua_State *L, struct block *b) {
 	memcpy(&len, b->buffer ,sizeof(len));
 
 	len -= 4;
-	uint8_t * buffer = malloc(len);
+	uint8_t * buffer = skynet_malloc(len);
 	uint8_t * ptr = buffer;
 	int sz = len;
 	if (len < BLOCK_SIZE - 4) {
@@ -585,11 +581,22 @@ _luaseri_unpack(lua_State *L) {
 	if (lua_isnoneornil(L,1)) {
 		return 0;
 	}
-	void * buffer = lua_touserdata(L,1);
+	void * buffer;
+	int len;
+	if (lua_type(L,1) == LUA_TSTRING) {
+		size_t sz;
+		 buffer = (void *)lua_tolstring(L,1,&sz);
+		len = (int)sz;
+	} else {
+		buffer = lua_touserdata(L,1);
+		len = luaL_checkinteger(L,2);
+	}
+	if (len == 0) {
+		return 0;
+	}
 	if (buffer == NULL) {
 		return luaL_error(L, "deserialize null pointer");
 	}
-	int len = luaL_checkinteger(L,2);
 
 	lua_settop(L,0);
 	struct read_block rb;
@@ -622,7 +629,7 @@ _luaseri_pack(lua_State *L) {
 
 	while (b) {
 		struct block * next = b->next;
-		free(b);
+		skynet_free(b);
 		b = next;
 	}
 

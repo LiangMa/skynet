@@ -1,23 +1,45 @@
 #include "skynet.h"
 #include "lua-seri.h"
 
+#define KNRM  "\x1B[0m"
+#define KRED  "\x1B[31m"
+
 #include <lua.h>
 #include <lauxlib.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 
+struct snlua {
+	lua_State * L;
+	struct skynet_context * ctx;
+	const char * preload;
+};
+
+static int 
+traceback (lua_State *L) {
+	const char *msg = lua_tostring(L, 1);
+	if (msg)
+		luaL_traceback(L, L, msg, 1);
+	else {
+		lua_pushliteral(L, "(no error message)");
+	}
+	return 1;
+}
+
 static int
 _cb(struct skynet_context * context, void * ud, int type, int session, uint32_t source, const void * msg, size_t sz) {
 	lua_State *L = ud;
 	int trace = 1;
+	int r;
 	int top = lua_gettop(L);
-	if (top == 1) {
+	if (top == 0) {
+		lua_pushcfunction(L, traceback);
 		lua_rawgetp(L, LUA_REGISTRYINDEX, _cb);
 	} else {
 		assert(top == 2);
-		lua_pushvalue(L,2);
 	}
+	lua_pushvalue(L,2);
 
 	lua_pushinteger(L, type);
 	lua_pushlightuserdata(L, (void *)msg);
@@ -25,13 +47,15 @@ _cb(struct skynet_context * context, void * ud, int type, int session, uint32_t 
 	lua_pushinteger(L, session);
 	lua_pushnumber(L, source);
 
-	int r = lua_pcall(L, 5, 0 , trace);
-	if (r == LUA_OK) 
+	r = lua_pcall(L, 5, 0 , trace);
+
+	if (r == LUA_OK) {
 		return 0;
+	}
 	const char * self = skynet_command(context, "REG", NULL);
 	switch (r) {
 	case LUA_ERRRUN:
-		skynet_error(context, "lua call [%x to %s : %d msgsz = %d] error : %s", source , self, session, sz, lua_tostring(L,-1));
+		skynet_error(context, "lua call [%x to %s : %d msgsz = %d] error : " KRED "%s" KNRM, source , self, session, sz, lua_tostring(L,-1));
 		break;
 	case LUA_ERRMEM:
 		skynet_error(context, "lua memory error : [%x to %s : %d]", source , self, session);
@@ -52,13 +76,11 @@ _cb(struct skynet_context * context, void * ud, int type, int session, uint32_t 
 static int
 _callback(lua_State *L) {
 	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
-	if (context == NULL) {
-		return luaL_error(L, "Init skynet context first");
-	}
 
 	luaL_checktype(L,1,LUA_TFUNCTION);
 	lua_settop(L,1);
 	lua_rawsetp(L, LUA_REGISTRYINDEX, _cb);
+
 	lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
 	lua_State *gL = lua_tothread(L,-1);
 
@@ -124,7 +146,10 @@ _sendname(lua_State *L, struct skynet_context * context, const char * dest) {
 		break;
 	}
 	default:
-		luaL_error(L, "skynet.send invalid param %s", lua_type(L,4));
+		luaL_error(L, "skynet.send invalid param %s", lua_typename(L,lua_type(L,4)));
+	}
+	if (session < 0) {
+		return 0;
 	}
 	lua_pushinteger(L,session);
 	return 1;
@@ -192,7 +217,12 @@ _send(lua_State *L) {
 		break;
 	}
 	default:
-		luaL_error(L, "skynet.send invalid param %s", lua_type(L,4));
+		luaL_error(L, "skynet.send invalid param %s", lua_typename(L, lua_type(L,4)));
+	}
+	if (session < 0) {
+		// send to invalid address
+		// todo: maybe throw error whould be better
+		return 0;
 	}
 	lua_pushinteger(L,session);
 	return 1;
@@ -224,7 +254,7 @@ _redirect(lua_State *L) {
 		break;
 	}
 	default:
-		luaL_error(L, "skynet.redirect invalid param %s", lua_type(L,5));
+		luaL_error(L, "skynet.redirect invalid param %s", lua_typename(L,mtype));
 	}
 	return 0;
 }
@@ -259,46 +289,44 @@ _harbor(lua_State *L) {
 	return 2;
 }
 
-// define in lua-remoteobj.c
-int remoteobj_init(lua_State *L);
+static int
+lpackstring(lua_State *L) {
+	_luaseri_pack(L);
+	char * str = (char *)lua_touserdata(L, -2);
+	int sz = lua_tointeger(L, -1);
+	lua_pushlstring(L, str, sz);
+	skynet_free(str);
+	return 1;
+}
 
 int
 luaopen_skynet_c(lua_State *L) {
 	luaL_checkversion(L);
 	
-	luaL_Reg pack[] = {
-		{ "pack", _luaseri_pack },
-		{ "unpack", _luaseri_unpack },
-		{ NULL, NULL },
-	};
-
 	luaL_Reg l[] = {
 		{ "send" , _send },
 		{ "genid", _genid },
 		{ "redirect", _redirect },
 		{ "command" , _command },
-		{ "callback" , _callback },
 		{ "error", _error },
 		{ "tostring", _tostring },
 		{ "harbor", _harbor },
+		{ "pack", _luaseri_pack },
+		{ "unpack", _luaseri_unpack },
+		{ "packstring", lpackstring },
+		{ "callback", _callback },
 		{ NULL, NULL },
 	};
 
-	lua_createtable(L, 0, (sizeof(pack) + sizeof(l))/sizeof(luaL_Reg)-2);
-	lua_newtable(L);
-	lua_pushstring(L,"__remote");
-	luaL_setfuncs(L,pack,2);
+	luaL_newlibtable(L, l);
 
 	lua_getfield(L, LUA_REGISTRYINDEX, "skynet_context");
-	struct skynet_context * ctx = lua_touserdata(L,-1);
+	struct skynet_context *ctx = lua_touserdata(L,-1);
 	if (ctx == NULL) {
 		return luaL_error(L, "Init skynet context first");
 	}
 
 	luaL_setfuncs(L,l,1);
-
-	lua_pushcfunction(L, remoteobj_init);
-	lua_setfield(L, -2, "remote_init");
 
 	return 1;
 }

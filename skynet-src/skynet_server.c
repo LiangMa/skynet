@@ -1,3 +1,5 @@
+#include "skynet.h"
+
 #include "skynet_server.h"
 #include "skynet_module.h"
 #include "skynet_handle.h"
@@ -5,14 +7,16 @@
 #include "skynet_timer.h"
 #include "skynet_harbor.h"
 #include "skynet_env.h"
-#include "skynet.h"
-#include "skynet_multicast.h"
-#include "skynet_group.h"
+#include "skynet_monitor.h"
+#include "skynet_imp.h"
+
+#include <pthread.h>
 
 #include <string.h>
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 #ifdef CALLING_CHECK
 
@@ -39,15 +43,50 @@ struct skynet_context {
 	void * cb_ud;
 	skynet_cb cb;
 	int session_id;
-	int init;
-	uint32_t forward;
 	struct message_queue *queue;
+	bool init;
+	bool endless;
 
 	CHECKCALLING_DECL
 };
 
+struct skynet_node {
+	int total;
+	int init;
+	uint32_t monitor_exit;
+	pthread_key_t handle_key;
+};
+
+static struct skynet_node G_NODE;
+
+int 
+skynet_context_total() {
+	return G_NODE.total;
+}
+
 static void
-_id_to_hex(char * str, uint32_t id) {
+context_inc() {
+	__sync_fetch_and_add(&G_NODE.total,1);
+}
+
+static void
+context_dec() {
+	__sync_fetch_and_sub(&G_NODE.total,1);
+}
+
+uint32_t 
+skynet_current_handle(void) {
+	if (G_NODE.init) {
+		void * handle = pthread_getspecific(G_NODE.handle_key);
+		return (uint32_t)(uintptr_t)handle;
+	} else {
+		uintptr_t v = (uint32_t)(-THREAD_MAIN);
+		return v;
+	}
+}
+
+static void
+id_to_hex(char * str, uint32_t id) {
 	int i;
 	static char hex[16] = { '0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F' };
 	str[0] = ':';
@@ -55,6 +94,20 @@ _id_to_hex(char * str, uint32_t id) {
 		str[i+1] = hex[(id >> ((7-i) * 4))&0xf];
 	}
 	str[9] = '\0';
+}
+
+struct drop_t {
+	uint32_t handle;
+};
+
+static void
+drop_message(struct skynet_message *msg, void *ud) {
+	struct drop_t *d = ud;
+	skynet_free(msg->data);
+	uint32_t source = d->handle;
+	assert(source);
+	// report error to the message source
+	skynet_send(NULL, source, msg->source, PTYPE_ERROR, 0, NULL, 0);
 }
 
 struct skynet_context * 
@@ -67,7 +120,7 @@ skynet_context_new(const char * name, const char *param) {
 	void *inst = skynet_module_instance_create(mod);
 	if (inst == NULL)
 		return NULL;
-	struct skynet_context * ctx = malloc(sizeof(*ctx));
+	struct skynet_context * ctx = skynet_malloc(sizeof(*ctx));
 	CHECKCALLING_INIT(ctx)
 
 	ctx->mod = mod;
@@ -77,11 +130,12 @@ skynet_context_new(const char * name, const char *param) {
 	ctx->cb_ud = NULL;
 	ctx->session_id = 0;
 
-	ctx->forward = 0;
-	ctx->init = 0;
+	ctx->init = false;
+	ctx->endless = false;
 	ctx->handle = skynet_handle_register(ctx);
 	struct message_queue * queue = ctx->queue = skynet_mq_create(ctx->handle);
 	// init function maybe use ctx->handle, so it must init at last
+	context_inc();
 
 	CHECKCALLING_BEGIN(ctx)
 	int r = skynet_module_instance_init(mod, inst, ctx, param);
@@ -89,21 +143,28 @@ skynet_context_new(const char * name, const char *param) {
 	if (r == 0) {
 		struct skynet_context * ret = skynet_context_release(ctx);
 		if (ret) {
-			ctx->init = 1;
+			ctx->init = true;
 		}
-		skynet_mq_force_push(queue);
-		printf("[:%x] launch %s %s\n",ret->handle, name, param ? param : "");
+		skynet_globalmq_push(queue);
+		if (ret) {
+			skynet_error(ret, "LAUNCH %s %s", name, param ? param : "");
+		}
 		return ret;
 	} else {
+		skynet_error(ctx, "FAILED launch %s", name);
+		uint32_t handle = ctx->handle;
 		skynet_context_release(ctx);
-		skynet_handle_retire(ctx->handle);
+		skynet_handle_retire(handle);
+		struct drop_t d = { handle };
+		skynet_mq_release(queue, drop_message, &d);
 		return NULL;
 	}
 }
 
 int
 skynet_context_newsession(struct skynet_context *ctx) {
-	int session = ++ctx->session_id;
+	// session always be a positive number
+	int session = (++ctx->session_id) & 0x7fffffff;
 	return session;
 }
 
@@ -113,26 +174,21 @@ skynet_context_grab(struct skynet_context *ctx) {
 }
 
 static void 
-_delete_context(struct skynet_context *ctx) {
+delete_context(struct skynet_context *ctx) {
 	skynet_module_instance_release(ctx->mod, ctx->instance);
 	skynet_mq_mark_release(ctx->queue);
-	free(ctx);
+	skynet_free(ctx);
+	context_dec();
 }
 
 struct skynet_context * 
 skynet_context_release(struct skynet_context *ctx) {
 	if (__sync_sub_and_fetch(&ctx->ref,1) == 0) {
-		_delete_context(ctx);
+		delete_context(ctx);
 		return NULL;
 	}
 	return ctx;
 }
-
-int 
-skynet_context_ref(struct skynet_context *ctx) {
-	return ctx->ref;
-}
-
 
 int
 skynet_context_push(uint32_t handle, struct skynet_message *message) {
@@ -146,6 +202,16 @@ skynet_context_push(uint32_t handle, struct skynet_message *message) {
 	return 0;
 }
 
+void 
+skynet_context_endless(uint32_t handle) {
+	struct skynet_context * ctx = skynet_handle_grab(handle);
+	if (ctx == NULL) {
+		return;
+	}
+	ctx->endless = true;
+	skynet_context_release(ctx);
+}
+
 int 
 skynet_isremote(struct skynet_context * ctx, uint32_t handle, int * harbor) {
 	int ret = skynet_harbor_message_isremote(handle);
@@ -156,108 +222,83 @@ skynet_isremote(struct skynet_context * ctx, uint32_t handle, int * harbor) {
 }
 
 static void
-_send_message(uint32_t des, struct skynet_message *msg) {
-	if (skynet_harbor_message_isremote(des)) {
-			struct remote_message * rmsg = malloc(sizeof(*rmsg));
-			rmsg->destination.handle = des;
-			rmsg->message = msg->data;
-			rmsg->sz = msg->sz;
-			skynet_harbor_send(rmsg, msg->source, msg->session);
-	} else {
-		if (skynet_context_push(des, msg)) {
-			free(msg->data);
-			skynet_error(NULL, "Drop message from %x forward to %x (size=%d)", msg->source, des, (int)msg->sz);
-		}
-	}
-}
-
-static int
-_forwarding(struct skynet_context *ctx, struct skynet_message *msg) {
-	if (ctx->forward) {
-		uint32_t des = ctx->forward;
-		ctx->forward = 0;
-		_send_message(des, msg);
-		return 1;
-	}
-	return 0;
-}
-
-static void
-_mc(void *ud, uint32_t source, const void * msg, size_t sz) {
-	struct skynet_context * ctx = ud;
-	int type = sz >> HANDLE_REMOTE_SHIFT;
-	sz &= HANDLE_MASK;
-	ctx->cb(ctx, ctx->cb_ud, type, 0, source, msg, sz);
-	if (ctx->forward) {
-		uint32_t des = ctx->forward;
-		ctx->forward = 0;
-		struct skynet_message message;
-		message.source = source;
-		message.session = 0;
-		message.data = malloc(sz);
-		memcpy(message.data, msg, sz);
-		message.sz = sz  | (type << HANDLE_REMOTE_SHIFT);
-		_send_message(des, &message);
-	}
-}
-
-static void
 _dispatch_message(struct skynet_context *ctx, struct skynet_message *msg) {
 	assert(ctx->init);
 	CHECKCALLING_BEGIN(ctx)
+	pthread_setspecific(G_NODE.handle_key, (void *)(uintptr_t)(ctx->handle));
 	int type = msg->sz >> HANDLE_REMOTE_SHIFT;
 	size_t sz = msg->sz & HANDLE_MASK;
-	if (type == PTYPE_MULTICAST) {
-		skynet_multicast_dispatch((struct skynet_multicast_message *)msg->data, ctx, _mc);
-	} else {
-		int reserve = ctx->cb(ctx, ctx->cb_ud, type, msg->session, msg->source, msg->data, sz);
-		reserve |= _forwarding(ctx, msg);
-		if (!reserve) {
-			free(msg->data);
-		}
+	if (!ctx->cb(ctx, ctx->cb_ud, type, msg->session, msg->source, msg->data, sz)) {
+		skynet_free(msg->data);
 	}
 	CHECKCALLING_END(ctx)
 }
 
-int
-skynet_context_message_dispatch(void) {
-	struct message_queue * q = skynet_globalmq_pop();
-	if (q==NULL)
-		return 1;
+void 
+skynet_context_dispatchall(struct skynet_context * ctx) {
+	// for skynet_error
+	struct skynet_message msg;
+	struct message_queue *q = ctx->queue;
+	while (!skynet_mq_pop(q,&msg)) {
+		_dispatch_message(ctx, &msg);
+	}
+}
+
+struct message_queue * 
+skynet_context_message_dispatch(struct skynet_monitor *sm, struct message_queue *q, int weight) {
+	if (q == NULL) {
+		q = skynet_globalmq_pop();
+		if (q==NULL)
+			return NULL;
+	}
 
 	uint32_t handle = skynet_mq_handle(q);
 
 	struct skynet_context * ctx = skynet_handle_grab(handle);
 	if (ctx == NULL) {
-		int s = skynet_mq_release(q);
-		if (s>0) {
-			skynet_error(NULL, "Drop message queue %x (%d messages)", handle,s);
-		}
-		return 0;
+		struct drop_t d = { handle };
+		skynet_mq_release(q, drop_message, &d);
+		return skynet_globalmq_pop();
 	}
 
+	int i,n=1;
 	struct skynet_message msg;
-	if (skynet_mq_pop(q,&msg)) {
-		skynet_context_release(ctx);
-		return 0;
-	}
 
-	if (ctx->cb == NULL) {
-		free(msg.data);
-		skynet_error(NULL, "Drop message from %x to %x without callback , size = %d",msg.source, handle, (int)msg.sz);
-	} else {
-		_dispatch_message(ctx, &msg);
+	for (i=0;i<n;i++) {
+		if (skynet_mq_pop(q,&msg)) {
+			skynet_context_release(ctx);
+			return skynet_globalmq_pop();
+		} else if (i==0 && weight >= 0) {
+			n = skynet_mq_length(q);
+			n >>= weight;
+		}
+
+		skynet_monitor_trigger(sm, msg.source , handle);
+
+		if (ctx->cb == NULL) {
+			skynet_free(msg.data);
+		} else {
+			_dispatch_message(ctx, &msg);
+		}
+
+		skynet_monitor_trigger(sm, 0,0);
 	}
 
 	assert(q == ctx->queue);
-	skynet_mq_pushglobal(q);
+	struct message_queue *nq = skynet_globalmq_pop();
+	if (nq) {
+		// If global mq is not empty , push q back, and return next queue (nq)
+		// Else (global mq is empty or block, don't push q back, and return q again (for next dispatch)
+		skynet_globalmq_push(q);
+		q = nq;
+	} 
 	skynet_context_release(ctx);
 
-	return 0;
+	return q;
 }
 
 static void
-_copy_name(char name[GLOBALNAME_LENGTH], const char * addr) {
+copy_name(char name[GLOBALNAME_LENGTH], const char * addr) {
 	int i;
 	for (i=0;i<GLOBALNAME_LENGTH && addr[i];i++) {
 		name[i] = addr[i];
@@ -265,41 +306,6 @@ _copy_name(char name[GLOBALNAME_LENGTH], const char * addr) {
 	for (;i<GLOBALNAME_LENGTH;i++) {
 		name[i] = '\0';
 	}
-}
-
-static const char *
-_group_command(struct skynet_context * ctx, const char * cmd, int handle, uint32_t v) {
-	uint32_t self;
-	if (v != 0) {
-		if (skynet_harbor_message_isremote(v)) {
-			skynet_error(ctx, "Can't add remote handle %x",v);
-			return NULL;
-		}
-		self = v;
-	} else {
-		self = ctx->handle;
-	}
-	if (strcmp(cmd, "ENTER") == 0) {
-		skynet_group_enter(handle, self);
-		return NULL;
-	}
-	if (strcmp(cmd, "LEAVE") == 0) {
-		skynet_group_leave(handle, self);
-		return NULL;
-	}
-	if (strcmp(cmd, "QUERY") == 0) {
-		uint32_t addr = skynet_group_query(handle);
-		if (addr == 0) {
-			return NULL;
-		}
-		_id_to_hex(ctx->result, addr);
-		return ctx->result;
-	}
-	if (strcmp(cmd, "CLEAR") == 0) {
-		skynet_group_clear(handle);
-		return NULL;
-	}
-	return NULL;
 }
 
 uint32_t 
@@ -314,162 +320,242 @@ skynet_queryname(struct skynet_context * context, const char * name) {
 	return 0;
 }
 
-const char * 
-skynet_command(struct skynet_context * context, const char * cmd , const char * param) {
-	if (strcmp(cmd,"TIMEOUT") == 0) {
-		char * session_ptr = NULL;
-		int ti = strtol(param, &session_ptr, 10);
-		int session = skynet_context_newsession(context);
-		if (session < 0) 
-			return NULL;
-		skynet_timeout(context->handle, ti, session);
-		sprintf(context->result, "%d", session);
-		return context->result;
+static void
+handle_exit(struct skynet_context * context, uint32_t handle) {
+	if (handle == 0) {
+		handle = context->handle;
+		skynet_error(context, "KILL self");
+	} else {
+		skynet_error(context, "KILL :%0x", handle);
 	}
+	if (G_NODE.monitor_exit) {
+		skynet_send(context,  handle, G_NODE.monitor_exit, PTYPE_CLIENT, 0, NULL, 0);
+	}
+	skynet_handle_retire(handle);
+}
 
-	if (strcmp(cmd,"LOCK") == 0) {
-		if (context->init == 0) {
-			return NULL;
-		}
-		int session = strtol(param, NULL, 10);
-		assert(session);
-		skynet_mq_lock(context->queue, session);
+// skynet command
+
+struct command_func {
+	const char *name;
+	const char * (*func)(struct skynet_context * context, const char * param);
+};
+
+static const char *
+cmd_timeout(struct skynet_context * context, const char * param) {
+	char * session_ptr = NULL;
+	int ti = strtol(param, &session_ptr, 10);
+	int session = skynet_context_newsession(context);
+	skynet_timeout(context->handle, ti, session);
+	sprintf(context->result, "%d", session);
+	return context->result;
+}
+
+static const char *
+cmd_reg(struct skynet_context * context, const char * param) {
+	if (param == NULL || param[0] == '\0') {
+		sprintf(context->result, ":%x", context->handle);
+		return context->result;
+	} else if (param[0] == '.') {
+		return skynet_handle_namehandle(context->handle, param + 1);
+	} else {
+		skynet_error(context, "Can't register global name %s in C", param);
 		return NULL;
 	}
+}
 
-	if (strcmp(cmd,"REG") == 0) {
-		if (param == NULL || param[0] == '\0') {
-			sprintf(context->result, ":%x", context->handle);
+static const char *
+cmd_query(struct skynet_context * context, const char * param) {
+	if (param[0] == '.') {
+		uint32_t handle = skynet_handle_findname(param+1);
+		if (handle) {
+			sprintf(context->result, ":%x", handle);
 			return context->result;
-		} else if (param[0] == '.') {
-			return skynet_handle_namehandle(context->handle, param + 1);
-		} else {
-			assert(context->handle!=0);
-			struct remote_name *rname = malloc(sizeof(*rname));
-			_copy_name(rname->name, param);
-			rname->handle = context->handle;
-			skynet_harbor_register(rname);
-			return NULL;
 		}
 	}
+	return NULL;
+}
 
-	if (strcmp(cmd,"NAME") == 0) {
-		int size = strlen(param);
-		char name[size+1];
-		char handle[size+1];
-		sscanf(param,"%s %s",name,handle);
-		if (handle[0] != ':') {
-			return NULL;
-		}
-		uint32_t handle_id = strtoul(handle+1, NULL, 16);
-		if (handle_id == 0) {
-			return NULL;
-		}
-		if (name[0] == '.') {
-			return skynet_handle_namehandle(handle_id, name + 1);
-		} else {
-			struct remote_name *rname = malloc(sizeof(*rname));
-			_copy_name(rname->name, name);
-			rname->handle = handle_id;
-			skynet_harbor_register(rname);
-		}
+static const char *
+cmd_name(struct skynet_context * context, const char * param) {
+	int size = strlen(param);
+	char name[size+1];
+	char handle[size+1];
+	sscanf(param,"%s %s",name,handle);
+	if (handle[0] != ':') {
 		return NULL;
 	}
+	uint32_t handle_id = strtoul(handle+1, NULL, 16);
+	if (handle_id == 0) {
+		return NULL;
+	}
+	if (name[0] == '.') {
+		return skynet_handle_namehandle(handle_id, name + 1);
+	} else {
+		skynet_error(context, "Can't set global name %s in C", name);
+	}
+	return NULL;
+}
 
-	if (strcmp(cmd,"NOW") == 0) {
-		uint32_t ti = skynet_gettime();
-		sprintf(context->result,"%u",ti);
+static const char *
+cmd_now(struct skynet_context * context, const char * param) {
+	uint32_t ti = skynet_gettime();
+	sprintf(context->result,"%u",ti);
+	return context->result;
+}
+
+static const char *
+cmd_exit(struct skynet_context * context, const char * param) {
+	handle_exit(context, 0);
+	return NULL;
+}
+
+static const char *
+cmd_kill(struct skynet_context * context, const char * param) {
+	uint32_t handle = 0;
+	if (param[0] == ':') {
+		handle = strtoul(param+1, NULL, 16);
+	} else if (param[0] == '.') {
+		handle = skynet_handle_findname(param+1);
+	} else {
+		skynet_error(context, "Can't kill %s",param);
+		// todo : kill global service
+	}
+	if (handle) {
+		handle_exit(context, handle);
+	}
+	return NULL;
+}
+
+static const char *
+cmd_launch(struct skynet_context * context, const char * param) {
+	size_t sz = strlen(param);
+	char tmp[sz+1];
+	strcpy(tmp,param);
+	char * args = tmp;
+	char * mod = strsep(&args, " \t\r\n");
+	args = strsep(&args, "\r\n");
+	struct skynet_context * inst = skynet_context_new(mod,args);
+	if (inst == NULL) {
+		return NULL;
+	} else {
+		id_to_hex(context->result, inst->handle);
 		return context->result;
 	}
+}
 
-	if (strcmp(cmd,"EXIT") == 0) {
-		skynet_handle_retire(context->handle);
-		return NULL;
+static const char *
+cmd_getenv(struct skynet_context * context, const char * param) {
+	return skynet_getenv(param);
+}
+
+static const char *
+cmd_setenv(struct skynet_context * context, const char * param) {
+	size_t sz = strlen(param);
+	char key[sz+1];
+	int i;
+	for (i=0;param[i] != ' ' && param[i];i++) {
+		key[i] = param[i];
 	}
+	if (param[i] == '\0')
+		return NULL;
 
-	if (strcmp(cmd,"KILL") == 0) {
-		uint32_t handle = 0;
+	key[i] = '\0';
+	param += i+1;
+	
+	skynet_setenv(key,param);
+	return NULL;
+}
+
+static const char *
+cmd_starttime(struct skynet_context * context, const char * param) {
+	uint32_t sec = skynet_gettime_fixsec();
+	sprintf(context->result,"%u",sec);
+	return context->result;
+}
+
+static const char *
+cmd_endless(struct skynet_context * context, const char * param) {
+	if (context->endless) {
+		strcpy(context->result, "1");
+		context->endless = false;
+		return context->result;
+	}
+	return NULL;
+}
+
+static const char *
+cmd_abort(struct skynet_context * context, const char * param) {
+	skynet_handle_retireall();
+	return NULL;
+}
+
+static const char *
+cmd_monitor(struct skynet_context * context, const char * param) {
+	uint32_t handle=0;
+	if (param == NULL || param[0] == '\0') {
+		if (G_NODE.monitor_exit) {
+			// return current monitor serivce
+			sprintf(context->result, ":%x", G_NODE.monitor_exit);
+			return context->result;
+		}
+		return NULL;
+	} else {
 		if (param[0] == ':') {
 			handle = strtoul(param+1, NULL, 16);
 		} else if (param[0] == '.') {
 			handle = skynet_handle_findname(param+1);
 		} else {
-			// todo : kill global service
-		}
-		if (handle) {
-			skynet_handle_retire(handle);
-		}
-		return NULL;
-	}
-
-	if (strcmp(cmd,"LAUNCH") == 0) {
-		size_t sz = strlen(param);
-		char tmp[sz+1];
-		strcpy(tmp,param);
-		char * args = tmp;
-		char * mod = strsep(&args, " \t\r\n");
-		args = strsep(&args, "\r\n");
-		struct skynet_context * inst = skynet_context_new(mod,args);
-		if (inst == NULL) {
-			fprintf(stderr, "Launch %s %s failed\n",mod,args);
-			return NULL;
-		} else {
-			_id_to_hex(context->result, inst->handle);
-			return context->result;
+			skynet_error(context, "Can't monitor %s",param);
+			// todo : monitor global service
 		}
 	}
+	G_NODE.monitor_exit = handle;
+	return NULL;
+}
 
-	if (strcmp(cmd,"GETENV") == 0) {
-		return skynet_getenv(param);
-	}
+static const char *
+cmd_mqlen(struct skynet_context * context, const char * param) {
+	int len = skynet_mq_length(context->queue);
+	sprintf(context->result, "%d", len);
+	return context->result;
+}
 
-	if (strcmp(cmd,"SETENV") == 0) {
-		size_t sz = strlen(param);
-		char key[sz+1];
-		int i;
-		for (i=0;param[i] != ' ' && param[i];i++) {
-			key[i] = param[i];
+static struct command_func cmd_funcs[] = {
+	{ "TIMEOUT", cmd_timeout },
+	{ "REG", cmd_reg },
+	{ "QUERY", cmd_query },
+	{ "NAME", cmd_name },
+	{ "NOW", cmd_now },
+	{ "EXIT", cmd_exit },
+	{ "KILL", cmd_kill },
+	{ "LAUNCH", cmd_launch },
+	{ "GETENV", cmd_getenv },
+	{ "SETENV", cmd_setenv },
+	{ "STARTTIME", cmd_starttime },
+	{ "ENDLESS", cmd_endless },
+	{ "ABORT", cmd_abort },
+	{ "MONITOR", cmd_monitor },
+	{ "MQLEN", cmd_mqlen },
+	{ NULL, NULL },
+};
+
+const char * 
+skynet_command(struct skynet_context * context, const char * cmd , const char * param) {
+	struct command_func * method = &cmd_funcs[0];
+	while(method->name) {
+		if (strcmp(cmd, method->name) == 0) {
+			return method->func(context, param);
 		}
-		if (param[i] == '\0')
-			return NULL;
-
-		key[i] = '\0';
-		param += i+1;
-		
-		skynet_setenv(key,param);
-		return NULL;
-	}
-
-	if (strcmp(cmd,"STARTTIME") == 0) {
-		uint32_t sec = skynet_gettime_fixsec();
-		sprintf(context->result,"%u",sec);
-		return context->result;
-	}
-
-	if (strcmp(cmd,"GROUP") == 0) {
-		int sz = strlen(param);
-		char tmp[sz+1];
-		strcpy(tmp,param);
-		tmp[sz] = '\0';
-		char cmd[sz+1];
-		int handle=0;
-		uint32_t addr=0;
-		sscanf(tmp, "%s %d :%x",cmd,&handle,&addr);
-		return _group_command(context, cmd, handle,addr);
+		++method;
 	}
 
 	return NULL;
 }
 
-void 
-skynet_forward(struct skynet_context * context, uint32_t destination) {
-	assert(context->forward == 0);
-	context->forward = destination;
-}
-
 static void
 _filter_args(struct skynet_context * context, int type, int *session, void ** data, size_t * sz) {
-	int dontcopy = type & PTYPE_TAG_DONTCOPY;
+	int needcopy = !(type & PTYPE_TAG_DONTCOPY);
 	int allocsession = type & PTYPE_TAG_ALLOCSESSION;
 	type &= 0xff;
 
@@ -478,22 +564,23 @@ _filter_args(struct skynet_context * context, int type, int *session, void ** da
 		*session = skynet_context_newsession(context);
 	}
 
-	char * msg;
-	if (dontcopy || *data == NULL) {
-		msg = *data;
-	} else {
-		msg = malloc(*sz+1);
+	if (needcopy && *data) {
+		char * msg = skynet_malloc(*sz+1);
 		memcpy(msg, *data, *sz);
 		msg[*sz] = '\0';
+		*data = msg;
 	}
-	*data = msg;
 
-	assert((*sz & HANDLE_MASK) == *sz);
 	*sz |= type << HANDLE_REMOTE_SHIFT;
 }
 
 int
 skynet_send(struct skynet_context * context, uint32_t source, uint32_t destination , int type, int session, void * data, size_t sz) {
+	if ((sz & HANDLE_MASK) != sz) {
+		skynet_error(context, "The message to %x is too large (sz = %lu)", destination, sz);
+		skynet_free(data);
+		return -1;
+	}
 	_filter_args(context, type, &session, (void **)&data, &sz);
 
 	if (source == 0) {
@@ -504,7 +591,7 @@ skynet_send(struct skynet_context * context, uint32_t source, uint32_t destinati
 		return session;
 	}
 	if (skynet_harbor_message_isremote(destination)) {
-		struct remote_message * rmsg = malloc(sizeof(*rmsg));
+		struct remote_message * rmsg = skynet_malloc(sizeof(*rmsg));
 		rmsg->destination.handle = destination;
 		rmsg->message = data;
 		rmsg->sz = sz;
@@ -517,8 +604,7 @@ skynet_send(struct skynet_context * context, uint32_t source, uint32_t destinati
 		smsg.sz = sz;
 
 		if (skynet_context_push(destination, &smsg)) {
-			free(data);
-			skynet_error(NULL, "Drop message from %x to %x (type=%d)(size=%d)", source, destination, type, (int)(sz & HANDLE_MASK));
+			skynet_free(data);
 			return -1;
 		}
 	}
@@ -534,15 +620,16 @@ skynet_sendname(struct skynet_context * context, const char * addr , int type, i
 	} else if (addr[0] == '.') {
 		des = skynet_handle_findname(addr + 1);
 		if (des == 0) {
-			free(data);
-			skynet_error(context, "Drop message to %s", addr);
+			if (type & PTYPE_TAG_DONTCOPY) {
+				skynet_free(data);
+			}
 			return session;
 		}
 	} else {
 		_filter_args(context, type, &session, (void **)&data, &sz);
 
-		struct remote_message * rmsg = malloc(sizeof(*rmsg));
-		_copy_name(rmsg->destination.name, addr);
+		struct remote_message * rmsg = skynet_malloc(sizeof(*rmsg));
+		copy_name(rmsg->destination.name, addr);
 		rmsg->destination.handle = 0;
 		rmsg->message = data;
 		rmsg->sz = sz;
@@ -566,7 +653,6 @@ skynet_context_init(struct skynet_context *ctx, uint32_t handle) {
 
 void 
 skynet_callback(struct skynet_context * context, void *ud, skynet_cb cb) {
-	assert(context->cb == NULL);
 	context->cb = cb;
 	context->cb_ud = ud;
 }
@@ -581,3 +667,28 @@ skynet_context_send(struct skynet_context * ctx, void * msg, size_t sz, uint32_t
 
 	skynet_mq_push(ctx->queue, &smsg);
 }
+
+void 
+skynet_globalinit(void) {
+	G_NODE.total = 0;
+	G_NODE.monitor_exit = 0;
+	G_NODE.init = 1;
+	if (pthread_key_create(&G_NODE.handle_key, NULL)) {
+		fprintf(stderr, "pthread_key_create failed");
+		exit(1);
+	}
+	// set mainthread's key
+	skynet_initthread(THREAD_MAIN);
+}
+
+void 
+skynet_globalexit(void) {
+	pthread_key_delete(G_NODE.handle_key);
+}
+
+void
+skynet_initthread(int m) {
+	uintptr_t v = (uint32_t)(-m);
+	pthread_setspecific(G_NODE.handle_key, (void *)v);
+}
+
