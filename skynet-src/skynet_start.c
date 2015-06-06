@@ -127,7 +127,6 @@ _worker(void *p) {
 	for (;;) {
 		q = skynet_context_message_dispatch(sm, q, weight);
 		if (q == NULL) {
-			CHECK_ABORT
 			if (pthread_mutex_lock(&m->mutex) == 0) {
 				++ m->sleep;
 				// "spurious wakeup" is harmless,
@@ -140,6 +139,7 @@ _worker(void *p) {
 				}
 			}
 		} 
+		CHECK_ABORT
 	}
 	return NULL;
 }
@@ -223,15 +223,18 @@ skynet_start(struct skynet_config * config) {
 	skynet_timer_init();
 	skynet_socket_init();
 
-	struct skynet_context *ctx = skynet_context_new("logger", config->logger);
+	struct skynet_context *ctx = skynet_context_new(config->logservice, config->logger);
 	if (ctx == NULL) {
-		fprintf(stderr, "Can't launch logger service\n");
+		fprintf(stderr, "Can't launch %s service\n", config->logservice);
 		exit(1);
 	}
 
 	bootstrap(ctx, config->bootstrap);
 
 	_start(config->thread);
+
+	// harbor_exit may call socket send, so it should exit before socket_free
+	skynet_harbor_exit();
 	skynet_socket_free();
 	if (config->daemon) {
 		daemon_exit(config->daemon);

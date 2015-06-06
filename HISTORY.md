@@ -1,3 +1,168 @@
+v1.0.0-alpha6 (2015-5-18)
+-----------
+* bugfix: httpc.get
+* bugfix: seri lib stack overflow
+* bugfix: udp send
+* bugfix: udp address
+* bugfix: sproto dump
+* add: sproto default
+* improve: skynet.wakeup (can wakeup skynet.call by raise an error)
+* improve: skynet.exit (raise error when uncall response)
+* remove: task overload warning
+* move: some skynet api move into skynet.manager
+
+v1.0.0-alpha5 (2015-4-27)
+-----------
+* merge lua 5.3 offical bugfix 
+* improve sproto rpc api
+* fix a deadlock bug when service retire
+* improve cluster config reload
+* add skynet.pcall for calling a function with `require`
+* better error log in loginserver
+
+v1.0.0-alpha4 (2015-4-13)
+-----------
+* sproto can share c struct between states
+* udp api changed (use lua string now)
+* fix memory leak in dns module
+
+v1.0.0-alpha3 (2015-3-30)
+-----------
+* Update sproto (bugfix)
+* Add async dns query
+* improve httpc
+
+v1.0.0-alpha2 (2015-3-16)
+-----------
+* Update examples client to lua 5.3
+* Patch lua 5.3 to interrupt the dead loop (for debug)
+* Update sproto (fix some bugs and support unordered map)
+
+v1.0.0-alpha (2015-3-9)
+-----------
+* Update lua from 5.2 to 5.3
+* Add an online lua debugger
+* Add sharemap as an example use case of stm
+* Improve sproto for multi-state
+* Improve mongodb driver
+* Fix known bugs
+
+v0.9.3 (2015-1-5)
+-----------
+* Add : mongo createIndex
+* Update : sproto
+* bugfix : sharedata check dirty flag when len/pairs metamethod
+* bugfix : multicast
+
+v0.9.2 (2014-12-8)
+-----------
+* Simplify the message queue
+* Add create_index in mongo driver
+* Fix a bug in big-endian architecture (sproto)
+
+v0.9.0 / v0.9.1 (2014-11-17)
+-----------
+* Add UDP support
+* Add IPv6 support
+* socket send package can define a release method
+* dispatch read before write in epoll
+* remove snax queue mode
+* Fix a bug in big-endian architecture
+
+v0.8.1 (2014-11-3)
+-----------
+* Send to an invalid remote service will raise an error
+* Bugifx: socket open address string
+* Remove sha1 from mysqlaux
+* merge lua and sproto bugfix , use crypt lib instead
+* Fix a memory leak in socket
+* minor bugfix in http module
+
+v0.8.0 (2014-10-27)
+-----------
+* Add mysql client driver
+* Bugfix : skynet.queue
+
+v0.7.4 (2014-10-13)
+-----------
+* Bugfix : clear coroutine pool when GC
+* hotfix : A bug introduce by 0.7.3 
+
+v0.7.3 (2014-10-13)
+-----------
+* Add some logs (warning) when overload
+* Bugfix: crash on exit
+
+v0.7.2 (2014-9-29)
+-----------
+* Bugfix : datacenter.wait
+* Bugfix : error in forker coroutine
+* Add skynet.term
+* Accept socket report port
+* sharedata can be update more than once
+
+v0.7.1 (2014-9-22)
+-----------
+* bugfix: wakeup sleep should return BREAK
+* bugfix: sharedatad load string
+* bugfix: dataserver forward error msg
+
+v0.7.0 (2014-9-8)
+-----------
+* Use sproto instead of cjson
+* Add message logger
+* Add hmac-sha1
+* Some minor bugfix
+
+v0.6.2 (2014-9-1)
+-----------
+* bugfix: only skynet.call response PTYPE_ERROR
+
+v0.6.1 (2014-8-25)
+-----------
+* bugfix: datacenter.wakeup
+* change struct msg name to avoid conflict in mac
+* improve seri library
+
+v0.6.0 (2014-8-18)
+-----------
+* add sharedata
+* bugfix: service exit before init would not report back
+* add skynet.response and check multicall skynet.ret
+* skynet.newservice throw error when lanuch faild
+* Don't check imported function in snax.hotfix
+* snax service add change SERVICE_PATH and add it to package.path
+* skynet.redirect support string address
+* bugfix: skynet.harbor.link may block
+* add skynet.harbor.queryname to query globalname
+* add cluster.proxy 
+* add DEBUG command exit (send a message to lua service by DEBUG)
+* add DEBUG command run (debug_console command inject)
+* bugfix : socketchannel connect once
+* bugfix : mongo driver
+
+v0.5.2 (2014-8-11)
+-----------
+* Bugfix : httpd request
+* Bugifx : http chunked mode
+* Add : httpc
+* timer support more than 497 days
+
+v0.5.1 (2014-8-4)
+-----------
+* Bugfix : http module
+* Bugfix : multicast local channel delete
+* Bugfix : socket.read(fd)
+
+v0.5.0 (2014-7-28)
+-----------
+* skynet.exit will quit service immediately.
+* Add snax.gateserver, snax.loginserver, snax.msgserver
+* Simplify clientsocket lib
+* mongo driver support replica set
+* config file support read from ENV
+* add simple httpd (see examples/simpleweb.lua)
+
 v0.4.2 (2014-7-14)
 -----------
 * Bugfix : invalid negative socket id 

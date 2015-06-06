@@ -1,18 +1,10 @@
 local skynet = require "skynet"
 local sc = require "socketchannel"
 local socket = require "socket"
-local cluster = require "cluster.c"
+local cluster = require "cluster.core"
 
 local config_name = skynet.getenv "cluster"
 local node_address = {}
-
-local function loadconfig()
-	local f = assert(io.open(config_name))
-	local source = f:read "*a"
-	f:close()
-	assert(load(source, "@"..config_name, "t", node_address))()
-end
-
 local node_session = {}
 local command = {}
 
@@ -28,6 +20,7 @@ local function open_channel(t, key)
 		host = host,
 		port = tonumber(port),
 		response = read_response,
+		nodelay = true,
 	}
 	assert(c:connect(true))
 	t[key] = c
@@ -36,6 +29,24 @@ local function open_channel(t, key)
 end
 
 local node_channel = setmetatable({}, { __index = open_channel })
+
+local function loadconfig()
+	local f = assert(io.open(config_name))
+	local source = f:read "*a"
+	f:close()
+	local tmp = {}
+	assert(load(source, "@"..config_name, "t", tmp))()
+	for name,address in pairs(tmp) do
+		assert(type(address) == "string")
+		if node_address[name] ~= address then
+			-- address changed
+			if rawget(node_channel, name) then
+				node_channel[name] = nil	-- reset connection
+			end
+			node_address[name] = address
+		end
+	end
+end
 
 function command.reload()
 	loadconfig()
@@ -51,13 +62,34 @@ function command.listen(source, addr, port)
 	skynet.ret(skynet.pack(nil))
 end
 
-function command.req(source, node, addr, msg, sz)
+local function send_request(source, node, addr, msg, sz)
 	local request
 	local c = node_channel[node]
 	local session = node_session[node]
 	-- msg is a local pointer, cluster.packrequest will free it
 	request, node_session[node] = cluster.packrequest(addr, session , msg, sz)
-	skynet.ret(c:request(request, session))
+
+	return c:request(request, session)
+end
+
+function command.req(...)
+	local ok, msg, sz = pcall(send_request, ...)
+	if ok then
+		skynet.ret(msg, sz)
+	else
+		skynet.error(msg)
+		skynet.response()(false)
+	end
+end
+
+local proxy = {}
+
+function command.proxy(source, node, name)
+	local fullname = node .. "." .. name
+	if proxy[fullname] == nil then
+		proxy[fullname] = skynet.newservice("clusterproxy", node, name)
+	end
+	skynet.ret(skynet.pack(proxy[fullname]))
 end
 
 local request_fd = {}

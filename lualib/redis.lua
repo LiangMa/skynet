@@ -1,7 +1,6 @@
 local skynet = require "skynet"
 local socket = require "socket"
 local socketchannel = require "socketchannel"
-local int64 = require "int64"
 
 local table = table
 local string = string
@@ -84,6 +83,7 @@ function redis.connect(db_conf)
 		host = db_conf.host,
 		port = db_conf.port or 6379,
 		auth = redis_login(db_conf.auth, db_conf.db),
+		nodelay = true,
 	}
 	-- try connect first only once
 	channel:connect(true)
@@ -101,12 +101,8 @@ local function pack_value(lines, v)
 		return
 	end
 
-	local t = type(v)
-	if t == "number" then
-		v = tostring(v)
-	elseif t == "userdata" then
-		v = int64.tostring(int64.new(v),10)
-	end
+	v = tostring(v)
+
 	table.insert(lines,"$"..#v)
 	table.insert(lines,v)
 end
@@ -199,6 +195,7 @@ function redis.watch(db_conf)
 		host = db_conf.host,
 		port = db_conf.port or 6379,
 		auth = watch_login(obj, db_conf.auth),
+		nodelay = true,
 	}
 	obj.__sock = channel
 

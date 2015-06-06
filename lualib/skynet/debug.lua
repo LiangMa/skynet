@@ -1,4 +1,8 @@
-return function (skynet)
+local io = io
+local table = table
+local debug = debug
+
+return function (skynet, export)
 
 local internal_info_func
 
@@ -14,7 +18,7 @@ function dbgcmd.MEM()
 end
 
 function dbgcmd.GC()
-	coroutine_pool = {}
+	export.clear()
 	collectgarbage "collect"
 end
 
@@ -37,6 +41,26 @@ function dbgcmd.INFO()
 	else
 		skynet.ret(skynet.pack(nil))
 	end
+end
+
+function dbgcmd.EXIT()
+	skynet.exit()
+end
+
+function dbgcmd.RUN(source, filename)
+	local inject = require "skynet.inject"
+	local output = inject(skynet, source, filename , export.dispatch, skynet.register_protocol)
+	collectgarbage "collect"
+	skynet.ret(skynet.pack(table.concat(output, "\n")))
+end
+
+function dbgcmd.TERM(service)
+	skynet.term(service)
+end
+
+function dbgcmd.REMOTEDEBUG(...)
+	local remotedebug = require "skynet.remotedebug"
+	remotedebug.start(export, ...)
 end
 
 local function _debug_dispatch(session, address, cmd, ...)
